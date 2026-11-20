@@ -170,7 +170,6 @@ jobs:
             --assign-public-ip true \
             --ssh-authorized-keys-file "$SSH_KEY_FILE" \
             --boot-volume-size-in-gbs 100 \
-            --boot-volume-vpus-per-gb 10 \
             --region "$OCI_REGION" \
             --output json \
             > "$RUNNER_TEMP/launch-result.json" \
