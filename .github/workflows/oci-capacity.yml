@@ -11,7 +11,7 @@ on:
 permissions:
   contents: read
 
-# 避免多个 Runner 同时创建实例
+# 防止同一仓库的任务并发创建实例
 concurrency:
   group: oci-a1-capacity
   cancel-in-progress: false
@@ -41,49 +41,64 @@ jobs:
       INSTANCE_NAME: instance-20261120-1448
 
     steps:
+      # 1. 初始化 Python
+      # 不启用 pip cache，避免缺少 requirements.txt 导致失败
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
+      # 2. 安装 OCI CLI
       - name: Install OCI CLI
+        shell: bash
         run: |
+          set -euo pipefail
+
           python -m pip install --upgrade pip
           python -m pip install oci-cli
 
+          oci --version
+
+      # 3. 配置 OCI API Authentication
       - name: Configure OCI Authentication
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p ~/.oci
-          chmod 700 ~/.oci
+          mkdir -p "$HOME/.oci"
+          chmod 700 "$HOME/.oci"
 
-          printf '%s' "$OCI_PRIVATE_KEY" \
-            > ~/.oci/oci_api_key.pem
+          # 写入 API 私钥
+          printf '%s\n' "$OCI_PRIVATE_KEY" \
+            > "$HOME/.oci/oci_api_key.pem"
 
-          chmod 600 ~/.oci/oci_api_key.pem
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
 
+          # 创建 OCI CLI 配置
           {
             echo "[DEFAULT]"
             echo "user=$OCI_USER_OCID"
-            echo "tenancy=$OCI_TENANCY_OCID"
             echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY_OCID"
             echo "region=$OCI_REGION"
             echo "key_file=$HOME/.oci/oci_api_key.pem"
 
             if [ -n "${OCI_API_KEY_PASSPHRASE:-}" ]; then
               echo "pass_phrase=$OCI_API_KEY_PASSPHRASE"
             fi
-          } > ~/.oci/config
+          } > "$HOME/.oci/config"
 
-          chmod 600 ~/.oci/config
+          chmod 600 "$HOME/.oci/config"
 
-          oci iam region list --output json > /dev/null
+          # 验证 OCI API 认证
+          oci iam region list \
+            --profile DEFAULT \
+            --region "$OCI_REGION" \
+            --output json > /dev/null
 
           echo "OCI authentication successful."
 
+      # 4. 检查实例并尝试创建
       - name: Check Existing Instance and Launch
         id: launch
         shell: bash
@@ -91,46 +106,56 @@ jobs:
           set -euo pipefail
 
           LOG_FILE="$RUNNER_TEMP/oci-launch.log"
+          INSTANCE_FILE="$RUNNER_TEMP/instances.json"
+
+          touch "$LOG_FILE"
 
           log() {
             echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] $*" \
               | tee -a "$LOG_FILE"
           }
 
-          # 检查是否已经存在同名实例
+          # 检查已有实例
           log "Checking existing instances..."
 
           oci compute instance list \
             --compartment-id "$OCI_COMPARTMENT_OCID" \
             --region "$OCI_REGION" \
             --all \
-            --output json > "$RUNNER_TEMP/instances.json"
+            --output json > "$INSTANCE_FILE"
 
           EXISTING=$(python -c '
-          import json, os
+          import json
+          import os
 
           with open(os.environ["RUNNER_TEMP"] + "/instances.json") as f:
               data = json.load(f)
 
           name = os.environ["INSTANCE_NAME"]
 
-          for instance in data.get("data", []):
-              if instance.get("display-name") == name:
-                  state = instance.get("lifecycle-state", "")
-                  if state != "TERMINATED":
-                      print(instance["id"])
+          for item in data.get("data", []):
+              if item.get("display-name") == name:
+                  if item.get("lifecycle-state") != "TERMINATED":
+                      print(item["id"])
                       break
           ')
 
           if [ -n "$EXISTING" ]; then
             log "Instance already exists: $EXISTING"
             log "Skipping creation."
+
             echo "result=already_exists" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # 保存 SSH 公钥
+          SSH_KEY_FILE="$RUNNER_TEMP/oci_ssh.pub"
+
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$SSH_KEY_FILE"
+          chmod 600 "$SSH_KEY_FILE"
+
           # 创建 A1.Flex
-          log "Attempting to launch A1.Flex..."
+          log "Launching VM.Standard.A1.Flex..."
 
           set +e
 
@@ -143,11 +168,9 @@ jobs:
             --image-id "$OCI_IMAGE_OCID" \
             --subnet-id "$OCI_SUBNET_OCID" \
             --assign-public-ip true \
-            --ssh-authorized-keys-file <(printf '%s\n' "$OCI_SSH_PUBLIC_KEY") \
+            --ssh-authorized-keys-file "$SSH_KEY_FILE" \
             --boot-volume-size-in-gbs 100 \
             --boot-volume-vpus-per-gb 10 \
-            --wait-for-state PROVISIONING \
-            --max-wait-seconds 120 \
             --region "$OCI_REGION" \
             --output json \
             > "$RUNNER_TEMP/launch-result.json" \
@@ -159,14 +182,19 @@ jobs:
 
           if [ "$RESULT" -eq 0 ]; then
 
+            cat "$RUNNER_TEMP/launch-result.json" \
+              >> "$LOG_FILE"
+
             INSTANCE_ID=$(python -c '
           import json
           with open("'"$RUNNER_TEMP"'/launch-result.json") as f:
               print(json.load(f)["data"]["id"])
           ')
 
-            log "SUCCESS: Instance created."
+            log "=================================="
+            log "INSTANCE CREATED SUCCESSFULLY"
             log "Instance OCID: $INSTANCE_ID"
+            log "=================================="
 
             echo "result=created" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
@@ -176,25 +204,29 @@ jobs:
 
           ERROR=$(cat "$RUNNER_TEMP/launch-error.log")
 
-          echo "$ERROR" | tee -a "$LOG_FILE"
+          printf '%s\n' "$ERROR" | tee -a "$LOG_FILE"
 
+          # 只对明确的容量不足进行自动重试
           if echo "$ERROR" | grep -Eiq \
             'Out of host capacity|Out of capacity for shape|Out of capacity'; then
 
             log "HOST CAPACITY UNAVAILABLE."
-            log "Will retry on the next scheduled workflow."
+            log "Will retry on the next scheduled run."
 
             echo "result=capacity_unavailable" >> "$GITHUB_OUTPUT"
 
-            # 容量不足不是工作流故障
+            # 正常结束本轮，下次定时任务继续尝试
             exit 0
           fi
 
-          log "FATAL ERROR. Automatic retry stopped for this run."
+          # 其他错误不盲目重试
+          log "FATAL ERROR. Please inspect the error above."
+
           echo "result=failed" >> "$GITHUB_OUTPUT"
 
           exit 1
 
+      # 5. 保存日志
       - name: Save execution log
         if: always()
         uses: actions/upload-artifact@v4
