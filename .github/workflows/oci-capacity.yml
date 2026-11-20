@@ -50,14 +50,15 @@ jobs:
 
       # 2. 安装 OCI CLI
       - name: Install OCI CLI
-        shell: bash
         run: |
           set -euo pipefail
 
-          python -m pip install --upgrade pip
-          python -m pip install oci-cli
+          python -m pip install \
+            -q \
+            --disable-pip-version-check \
+            oci-cli
 
-          oci --version
+          echo "OCI CLI installed: $(oci --version)"
 
       # 3. 配置 OCI API Authentication
       - name: Configure OCI Authentication
