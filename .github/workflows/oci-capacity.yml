@@ -201,8 +201,22 @@ jobs:
 
             exit 0
           fi
+          ERROR=$(cat "$RUNNER_TEMP/launch-error.log" 2>/dev/null || true)
 
-          ERROR=$(cat "$RUNNER_TEMP/launch-error.log")
+          RESULT_OUTPUT=$(cat "$RUNNER_TEMP/launch-result.json" 2>/dev/null || true)
+
+          echo "===== OCI STDERR ====="
+          echo "$ERROR"
+
+          echo "===== OCI STDOUT ====="
+          echo "$RESULT_OUTPUT"
+
+          {
+            echo "===== OCI STDERR ====="
+            echo "$ERROR"
+            echo "===== OCI STDOUT ====="
+            echo "$RESULT_OUTPUT"
+          } >> "$LOG_FILE"
 
           printf '%s\n' "$ERROR" | tee -a "$LOG_FILE"
 
@@ -226,12 +240,16 @@ jobs:
 
           exit 1
 
-      # 5. 保存日志
-      - name: Save execution log
+      # 5. 保存完整诊断日志
+      - name: Save execution diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oci-capacity-log-${{ github.run_number }}
-          path: ${{ runner.temp }}/oci-launch.log
+          name: oci-capacity-diagnostics-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/oci-launch.log
+            ${{ runner.temp }}/launch-result.json
+            ${{ runner.temp }}/launch-error.log
+            ${{ runner.temp }}/instances.json
           if-no-files-found: ignore
           retention-days: 7
